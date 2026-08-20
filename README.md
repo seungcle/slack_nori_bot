@@ -50,6 +50,13 @@ Slack 앱 설정:
 uv run nori.py
 ```
 
+맥이 잠들면 노리도, 노리가 띄운 Remote Control 세션도 같이 멈춘다.
+폰에서 계속 쓸 거면 유휴 슬립을 막고 띄운다.
+
+```bash
+caffeinate -i uv run nori.py
+```
+
 ## 명령어
 
 | 명령 | 하는 일 |

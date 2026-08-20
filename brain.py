@@ -254,11 +254,45 @@ class State(MessagesState):
     channel: str
 
 
-def _trim(messages: list) -> list:
+def _turn_rounds(messages: list) -> int:
+    """이번 턴(마지막 사용자 발화 이후)에 도구를 몇 번 불렀나."""
+    count = 0
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            break
+        if isinstance(m, AIMessage) and m.tool_calls:
+            count += 1
+    return count
+
+
+def _repair(messages: list) -> list:
+    """짝 없는 tool_call 을 걷어낸다.
+
+    OpenAI 는 tool_calls 가 달린 assistant 메시지 뒤에 그 id 로 답한 tool 메시지가
+    없으면 400 을 낸다. 실행이 중간에 끊기면 그런 상태가 체크포인터에 저장되고,
+    그 뒤로 그 채널은 무슨 말을 해도 계속 400 이 난다. 여기서 되살린다.
+    """
+    answered = {m.tool_call_id for m in messages if isinstance(m, ToolMessage)}
+    orphaned: set[str] = set()
+    out = []
+    for m in messages:
+        if isinstance(m, AIMessage) and m.tool_calls:
+            if any(c["id"] not in answered for c in m.tool_calls):
+                orphaned.update(c["id"] for c in m.tool_calls)
+                if not m.content:
+                    continue                       # 남길 내용도 없으면 통째로 버린다
+                m = AIMessage(content=m.content)   # 호출만 떼어낸다
+        elif isinstance(m, ToolMessage) and m.tool_call_id in orphaned:
+            continue
+        out.append(m)
+    return out
+
+
+def _prepare(messages: list) -> list:
     cut = messages[-HISTORY_LIMIT:]
     while cut and isinstance(cut[0], ToolMessage):
         cut.pop(0)
-    return cut
+    return _repair(cut)
 
 
 _llm = None
@@ -272,31 +306,41 @@ def _model():
 
 
 def _agent(state: State) -> dict:
-    answer = _model().invoke([SystemMessage(system_prompt())] + _trim(state["messages"]))
+    answer = _model().invoke([SystemMessage(system_prompt())] + _prepare(state["messages"]))
     if answer.content and (sink := _sinks.get(state["channel"])):
         sink.say(str(answer.content))
     return {"messages": [answer]}
 
 
 def _act(state: State) -> dict:
+    """호출된 도구를 실행한다. 상한을 넘겨도 **모든 tool_call 에 반드시 답한다** —
+    답 없이 끝내면 그 대화는 다음 턴부터 400 으로 죽는다."""
     last = state["messages"][-1]
+    over = _turn_rounds(state["messages"]) > MAX_TOOL_ROUNDS
     out = []
     for call in getattr(last, "tool_calls", []):
-        fn = DISPATCH.get(call["name"])
-        try:
-            text = fn(state["channel"], **call["args"]) if fn else f"모르는 도구: {call['name']}"
-        except Exception as exc:
-            text = f"도구 실행 중 오류: {exc}"
+        if over:
+            text = "도구를 너무 여러 번 불러서 여기서 멈췄다."
+        else:
+            fn = DISPATCH.get(call["name"])
+            try:
+                text = fn(state["channel"], **call["args"]) if fn else f"모르는 도구: {call['name']}"
+            except Exception as exc:
+                text = f"도구 실행 중 오류: {exc}"
         out.append(ToolMessage(content=text, tool_call_id=call["id"]))
+    if over and (sink := _sinks.get(state["channel"])):
+        sink.say("도구를 너무 여러 번 부르게 돼서 멈췄어. 다시 말해줄래?")
     return {"messages": out}
 
 
-def _route(state: State) -> str:
+def _from_agent(state: State) -> str:
     last = state["messages"][-1]
-    if not (isinstance(last, AIMessage) and last.tool_calls):
-        return END
-    rounds = sum(1 for m in state["messages"] if isinstance(m, AIMessage) and m.tool_calls)
-    return "act" if rounds <= MAX_TOOL_ROUNDS else END
+    return "act" if isinstance(last, AIMessage) and last.tool_calls else END
+
+
+def _from_act(state: State) -> str:
+    # 상한을 넘겼으면 여기서 끝낸다. tool 응답은 이미 다 채워둬서 상태는 온전하다.
+    return END if _turn_rounds(state["messages"]) > MAX_TOOL_ROUNDS else "agent"
 
 
 _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -306,8 +350,9 @@ _builder = StateGraph(State)
 _builder.add_node("agent", _agent)
 _builder.add_node("act", _act)
 _builder.add_edge(START, "agent")
-_builder.add_conditional_edges("agent", _route, {"act": "act", END: END})
-_builder.add_edge("act", "agent")     # 도구 결과를 보고 노리가 사람 말로 정리한다
+_builder.add_conditional_edges("agent", _from_agent, {"act": "act", END: END})
+# 도구 결과를 보고 노리가 사람 말로 정리한다
+_builder.add_conditional_edges("act", _from_act, {"agent": "agent", END: END})
 graph = _builder.compile(checkpointer=_saver)
 
 
