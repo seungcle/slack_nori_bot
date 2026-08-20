@@ -123,3 +123,81 @@ def cwd_for_pid(pid: str) -> str | None:
 
 def sessions_for(cwd: str, limit: int = 20) -> list[Session]:
     return [s for s in all_sessions() if s.cwd == cwd][:limit]
+
+
+# ------------------------------------------------- 세션에서 실제로 무슨 일이 있었나
+
+TAIL_BYTES = 2_000_000     # 큰 세션 파일은 끝부분만 읽는다
+
+
+def find_jsonl(sid: str) -> Path | None:
+    """세션 id(앞자리만 줘도 됨)로 transcript 파일을 찾는다."""
+    if not PROJECTS_DIR.is_dir():
+        return None
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for jsonl in project_dir.glob("*.jsonl"):
+            if jsonl.stem.startswith(sid):
+                return jsonl
+    return None
+
+
+def _tail_records(jsonl: Path) -> list[dict]:
+    with jsonl.open("rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - TAIL_BYTES))
+        blob = f.read()
+    lines = blob.split(b"\n")
+    if size > TAIL_BYTES:
+        lines = lines[1:]                    # 잘린 첫 줄은 버린다
+    out = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _blocks(message: dict) -> tuple[str, list[str]]:
+    """(본문 텍스트, 쓴 도구 이름들)"""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content, []
+    text, tools = [], []
+    for b in content or []:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "text":
+            text.append(b.get("text", ""))
+        elif b.get("type") == "tool_use":
+            tools.append(b.get("name", "?"))
+    return " ".join(text).strip(), tools
+
+
+def recent_turns(sid: str, limit: int = 12, budget: int = 6000) -> str:
+    """세션에서 최근 대화를 사람이 읽을 수 있는 형태로 뽑는다."""
+    jsonl = find_jsonl(sid)
+    if jsonl is None:
+        return ""
+
+    turns = []
+    for rec in _tail_records(jsonl):
+        kind = rec.get("type")
+        if kind not in {"user", "assistant"} or rec.get("isSidechain"):
+            continue
+        text, tools = _blocks(rec.get("message") or {})
+        if not text and not tools:
+            continue
+        who = "👤" if kind == "user" else "🤖"
+        mark = f" [도구: {', '.join(dict.fromkeys(tools))}]" if tools else ""
+        turns.append(f"{who} {_clip(text, 700)}{mark}")
+
+    turns = turns[-limit:]
+    while turns and len("\n".join(turns)) > budget:
+        turns.pop(0)
+    return "\n".join(turns)

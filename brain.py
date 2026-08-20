@@ -1,4 +1,9 @@
-"""노리의 머리 — GPT가 모든 말을 먼저 읽고, 필요할 때만 Claude를 깨운다.
+"""노리의 머리 — 모든 말을 GPT가 먼저 읽는다.
+
+노리는 직접 코딩하지 않는다. 하는 일은 셋이다.
+  1. 그냥 대화
+  2. 원하는 프로젝트를 Claude Remote Control 세션으로 열어주기 (실제 작업은 Claude 앱에서)
+  3. 그 세션에서 무슨 일이 있었는지 읽어와서 같이 이야기하기
 
 대화 맥락은 LangGraph 체크포인터(SQLite)에 채널별로 저장되므로 봇을 재시작해도 이어진다.
 """
@@ -7,7 +12,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -23,17 +27,14 @@ import sessions
 DB_PATH = os.environ.get("NORI_DB", str(Path(__file__).parent / "nori.db"))
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
 HISTORY_LIMIT = 30      # LLM에 넣을 최근 메시지 수
+MAX_TOOL_ROUNDS = 4     # 도구 호출 무한루프 방지
 
 
 # ------------------------------------------------------------ Slack 출력 통로
 
 @dataclass
 class Sink:
-    """brain 이 Slack에 글을 쓰는 통로. nori.py가 구현해서 넘긴다."""
-    say: Callable[[str], str]              # 일반 메시지(댓글 아님) → ts
-    reply: Callable[[str, str], str]       # (부모 ts, 본문) → ts
-    update: Callable[[str, str], None]     # (ts, 본문)
-    result: Callable[..., None]            # (부모 ts, 갱신할 ts, 본문, 원문경로) — 길면 쪼개 보낸다
+    say: Callable[[str], str]      # 메시지 보내기 → ts
 
 
 _sinks: dict[str, Sink] = {}
@@ -45,45 +46,71 @@ def bind(channel: str, sink: Sink) -> None:
 
 # ------------------------------------------------------------------ 도구 정의
 
-RUN_CLAUDE = {
-    "type": "function",
-    "function": {
-        "name": "run_claude",
-        "description": (
-            "사용자의 Mac에서 Claude Code를 실제로 돌린다. 코드 수정·파일 조사·명령 실행처럼 "
-            "실제 작업이 필요할 때만 호출한다. 어느 프로젝트인지 확실하지 않으면 호출하지 말고 "
-            "먼저 사람에게 되물어라. 잡담이나 일반 질문에는 절대 호출하지 않는다."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "project": {
-                    "type": "string",
-                    "description": "프로젝트 절대경로. 아래 목록에 적힌 그대로 쓴다.",
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "open_project",
+            "description": (
+                "지정한 프로젝트를 Claude Remote Control 세션으로 연다. 열고 나면 사용자가 "
+                "폰의 Claude 앱에서 직접 그 세션을 몰고 작업한다. 사용자가 '열어줘', '켜줘', "
+                "'작업하고 싶어' 라고 할 때 부른다. 네가 코드를 고치는 게 아니다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "프로젝트 절대경로. 아래 목록에 적힌 그대로.",
+                    }
                 },
-                "session": {
-                    "type": "string",
-                    "description": "이어붙일 세션 id의 앞 8자. 새 세션으로 시작하려면 'new'.",
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "Claude에게 그대로 전달할 지시문. 반드시 한국어로, 사용자의 의도를 살려 구체적으로.",
-                },
+                "required": ["project"],
             },
-            "required": ["project", "session", "prompt"],
         },
     },
-}
+    {
+        "type": "function",
+        "function": {
+            "name": "read_work",
+            "description": (
+                "Claude 세션에서 최근에 무슨 작업이 있었는지 읽어온다. 사용자가 '아까 뭐 했어?', "
+                "'그 작업 어떻게 됐어?', '뭐 고쳤어?' 처럼 물으면 부른다. 결과를 받아 네가 "
+                "사람 말로 정리해서 답한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "세션 id 앞 8자. 모르면 프로젝트의 가장 최근 세션을 쓰도록 빈 값.",
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "프로젝트 절대경로. session 을 모를 때 필요하다.",
+                    },
+                    "turns": {
+                        "type": "integer",
+                        "description": "가져올 최근 대화 수. 기본 12.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+]
 
 COMMANDS = {
     "/clear": "이 채널의 대화 기억을 지운다",
     "/help": "쓸 수 있는 명령어 목록",
     "/projects": "Claude 프로젝트와 최근 세션 목록",
-    "/mode": "현재 Claude 권한 모드 확인",
+    "/live": "지금 켜져 있는 Claude 세션",
+    "/trust": "새 폴더 신뢰 확인이 걸려 있으면 승인",
 }
 
 
-def catalog(projects: int = 12, per_project: int = 6) -> str:
+# ------------------------------------------------------------------ 시스템 프롬프트
+
+def catalog(projects: int = 12, per_project: int = 5) -> str:
     lines = []
     for cwd, count, _ in sessions.projects(limit=projects):
         lines.append(f"### {cwd}  (세션 {count}개)")
@@ -92,36 +119,48 @@ def catalog(projects: int = 12, per_project: int = 6) -> str:
     return "\n".join(lines) or "(아직 세션 기록 없음)"
 
 
+def live_list() -> str:
+    rows = claude_runner.agents()
+    if not rows:
+        return "(켜져 있는 세션 없음)"
+    return "\n".join(
+        f"- {a.get('name','?')} · {a.get('sessionId','')[:8]} · {a.get('cwd','')}"
+        for a in rows
+    )
+
+
 def system_prompt() -> str:
     cmds = "\n".join(f"- `{k}` — {v}" for k, v in COMMANDS.items())
-    return f"""너는 '노리'다. 사용자의 Mac에 붙어 있는 Slack 비서이고, 한국어로 편하게 반말 섞어 짧게 답한다.
+    return f"""너는 '노리'다. 사용자의 Mac에 붙어 있는 Slack 비서이고, 한국어로 짧고 편하게 답한다.
+
+**너는 코드를 직접 고치지 않는다.** 실제 작업은 사용자가 폰의 Claude 앱에서 Remote Control로 한다.
+네 역할은 셋이다.
+1. 그냥 대화하고 질문에 답하기
+2. 사용자가 원하는 프로젝트를 open_project 로 열어주기
+3. 그 세션에서 무슨 일이 있었는지 read_work 로 읽어와 같이 이야기하기
+
+규칙:
+- 사용자가 말한 이름이 아래 목록의 프로젝트 하나와 분명히 맞으면 되묻지 말고 바로 연다.
+- 후보가 둘 이상이라 진짜 헷갈릴 때만 후보를 대며 되묻는다.
+- read_work 결과는 그대로 뱉지 말고, 뭘 했는지 사람 말로 3~5줄로 정리해라.
+- 잡담이나 일반 지식 질문에는 도구를 부르지 않는다.
+- 도구를 부를 때 content 는 비워라.
 
 이 채널의 대화는 파일에 저장돼서 계속 기억한다. 봇을 재시작해도 이어진다.
-사용자가 `/clear` 를 치기 전까지는 지워지지 않으니, "기억 못 한다"는 말은 하지 마라.
+`/clear` 전까지는 지워지지 않으니 "기억 못 한다"는 말은 하지 마라.
 
-사용자가 하는 모든 말(음성 포함)을 네가 먼저 읽는다. 판단은 둘 중 하나다.
-
-1. 그냥 대화·질문·설명 요청 → 네가 직접 답한다. 도구를 부르지 않는다.
-2. Mac에서 실제 작업이 필요하다(코드 고치기, 파일 뒤지기, 뭔가 만들기) → run_claude 를 부른다.
-
-run_claude 를 부를 때 규칙:
-- 사용자가 말한 이름이 아래 목록의 프로젝트 하나와 분명히 맞으면 되묻지 말고 바로 부른다.
-  (예: "노리", "nori" → 아래 목록에서 폴더 이름이 nori 인 경로)
-- 후보가 둘 이상이라 진짜 헷갈릴 때만 후보를 대며 되묻는다.
-- 사용자가 "아까 그거", "그 세션" 처럼 말하면 대화 기록을 보고 판단한다.
-- 이어갈 이유가 뚜렷하지 않으면 session 은 'new'.
-- prompt 는 반드시 한국어로 쓴다.
-- 도구를 부를 때 content 는 비워라. 시작 알림은 시스템이 따로 보낸다.
-
-쓸 수 있는 명령어(사용자가 물어보면 이걸 알려준다):
+쓸 수 있는 명령어(사용자가 물어보면 알려준다):
 {cmds}
 
-현재 Mac의 Claude Code 프로젝트와 최근 세션:
+지금 켜져 있는 Claude 세션:
+{live_list()}
+
+이 Mac의 Claude 프로젝트와 최근 세션:
 {catalog()}
 """
 
 
-# ---------------------------------------------------------------- 실행 로직
+# ---------------------------------------------------------------- 도구 실행
 
 def _resolve_project(name: str) -> str | None:
     known = [cwd for cwd, _, _ in sessions.projects(limit=1000)]
@@ -134,55 +173,37 @@ def _resolve_project(name: str) -> str | None:
     return None
 
 
-def _resolve_session(cwd: str, ref: str) -> str | None:
-    ref = (ref or "").strip()
-    if not ref or ref.lower() in {"new", "새", "새로", "none"}:
-        return None
-    for s in sessions.sessions_for(cwd, limit=1000):
-        if s.sid.startswith(ref):
-            return s.sid
-    return None
-
-
-RUNS_DIR = Path(os.environ.get("NORI_RUNS", Path(__file__).parent / "runs"))
-
-
-def _save_run(cwd: str, prompt: str, res) -> str:
-    """Slack에 다 못 실은 원문을 통째로 남겨둔다."""
-    try:
-        RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        path = RUNS_DIR / f"{res.session_id[:8] or 'unknown'}-{int(time.time())}.md"
-        path.write_text(
-            f"# {cwd}\n\n## 지시\n{prompt}\n\n## 결과\n{res.text}\n", encoding="utf-8"
-        )
-        return str(path)
-    except OSError:
-        return ""
-
-
-def _run_claude(channel: str, project: str, session: str, prompt: str) -> str:
-    sink = _sinks.get(channel)
-    if sink is None:
-        return "Slack 출력 통로가 없어 실행하지 못했다."
-
+def _open_project(channel: str, project: str) -> str:
     cwd = _resolve_project(project)
     if cwd is None:
-        sink.say(f"`{project}` 라는 프로젝트를 못 찾겠어. 다시 말해줄래?")
-        return f"프로젝트 '{project}' 를 찾지 못해 실행하지 않았다."
+        return f"'{project}' 라는 프로젝트를 목록에서 못 찾았다. 사용자에게 다시 물어봐라."
 
-    sid = _resolve_session(cwd, session)
-    tag = f"`{sid[:8]}` 세션에 이어서" if sid else "새 세션으로"
-    parent = sink.say(f"📂 `{cwd}`\n🧵 {tag} 시작할게.")
-    running = sink.reply(parent, "⏳ Claude 작업 중…")
+    res = claude_runner.launch(cwd)
+    if not res.ok:
+        return f"열기 실패. {res.message}"
+    return (f"열었다. 프로젝트 {cwd}, 세션 {res.session_id[:8] or '(확인중)'}, "
+            f"이름 {res.name}. {res.message} "
+            f"사용자에게 Claude 앱에서 이 세션을 잡으면 된다고 알려줘라.")
 
-    res = claude_runner.run(prompt, cwd=cwd, session_id=sid)
-    raw = _save_run(cwd, prompt, res)
-    head = "✅" if res.ok else "⚠️"
-    foot = f"\n\n_${res.cost_usd:.3f} · `{res.session_id[:8]}`_"
-    sink.result(parent, running, f"{head} {res.text}{res.denial_note}{foot}", raw)
 
-    status = "성공" if res.ok else "실패"
-    return f"Claude 실행 {status}. 프로젝트 {cwd}, 세션 {res.session_id[:8]}. 결과 요약: {res.text[:400]}"
+def _read_work(channel: str, session: str = "", project: str = "", turns: int = 12) -> str:
+    sid = (session or "").strip()
+    if not sid:
+        cwd = _resolve_project(project) if project else None
+        if cwd is None:
+            return "어느 프로젝트인지 몰라서 못 읽었다. 사용자에게 물어봐라."
+        recent = sessions.sessions_for(cwd, limit=1)
+        if not recent:
+            return f"{cwd} 에 세션 기록이 없다."
+        sid = recent[0].sid
+
+    body = sessions.recent_turns(sid, limit=max(4, min(int(turns or 12), 30)))
+    if not body:
+        return f"세션 {sid[:8]} 의 기록을 찾지 못했다."
+    return f"세션 {sid[:8]} 의 최근 대화:\n{body}"
+
+
+DISPATCH = {"open_project": _open_project, "read_work": _read_work}
 
 
 # -------------------------------------------------------------------- 그래프
@@ -192,7 +213,6 @@ class State(MessagesState):
 
 
 def _trim(messages: list) -> list:
-    """토큰이 무한정 늘지 않게 자르되, 짝 잃은 ToolMessage 로 시작하지 않게 한다."""
     cut = messages[-HISTORY_LIMIT:]
     while cut and isinstance(cut[0], ToolMessage):
         cut.pop(0)
@@ -205,7 +225,7 @@ _llm = None
 def _model():
     global _llm
     if _llm is None:
-        _llm = ChatOpenAI(model=MODEL).bind_tools([RUN_CLAUDE])
+        _llm = ChatOpenAI(model=MODEL).bind_tools(TOOLS)
     return _llm
 
 
@@ -220,14 +240,21 @@ def _act(state: State) -> dict:
     last = state["messages"][-1]
     out = []
     for call in getattr(last, "tool_calls", []):
-        text = _run_claude(state["channel"], **call["args"])
+        fn = DISPATCH.get(call["name"])
+        try:
+            text = fn(state["channel"], **call["args"]) if fn else f"모르는 도구: {call['name']}"
+        except Exception as exc:
+            text = f"도구 실행 중 오류: {exc}"
         out.append(ToolMessage(content=text, tool_call_id=call["id"]))
     return {"messages": out}
 
 
 def _route(state: State) -> str:
     last = state["messages"][-1]
-    return "act" if isinstance(last, AIMessage) and last.tool_calls else END
+    if not (isinstance(last, AIMessage) and last.tool_calls):
+        return END
+    rounds = sum(1 for m in state["messages"] if isinstance(m, AIMessage) and m.tool_calls)
+    return "act" if rounds <= MAX_TOOL_ROUNDS else END
 
 
 _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -238,7 +265,7 @@ _builder.add_node("agent", _agent)
 _builder.add_node("act", _act)
 _builder.add_edge(START, "agent")
 _builder.add_conditional_edges("agent", _route, {"act": "act", END: END})
-_builder.add_edge("act", END)   # Claude 결과는 스레드에 직접 붙었으니 다시 LLM을 태우지 않는다
+_builder.add_edge("act", "agent")     # 도구 결과를 보고 노리가 사람 말로 정리한다
 graph = _builder.compile(checkpointer=_saver)
 
 
@@ -247,7 +274,7 @@ graph = _builder.compile(checkpointer=_saver)
 def handle(channel: str, text: str) -> None:
     graph.invoke(
         {"messages": [HumanMessage(text)], "channel": channel},
-        config={"configurable": {"thread_id": channel}},
+        config={"configurable": {"thread_id": channel}, "recursion_limit": 20},
     )
 
 

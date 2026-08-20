@@ -1,4 +1,8 @@
-"""Nori — Slack에서 말하면(음성 포함) GPT가 먼저 듣고, 필요할 때 Claude를 깨우는 봇."""
+"""Nori — Slack에서 말하면(음성 포함) GPT가 먼저 듣는 비서.
+
+노리는 코드를 고치지 않는다. 프로젝트를 Claude Remote Control 세션으로 열어주고,
+거기서 벌어진 일을 읽어와 같이 이야기한다.
+"""
 
 import os
 import re
@@ -19,8 +23,9 @@ import gpt            # noqa: E402
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
 AUDIO_EXTS = {"m4a", "mp3", "mp4", "mpga", "wav", "webm", "ogg", "oga", "amr", "flac"}
+
 # Slack 한도는 글자 수가 아니라 UTF-8 바이트 기준이다. 한글은 글자당 3바이트라
-# 글자 수로 재면 msg_too_long 이 난다. 넉넉히 잡아 2800바이트로 쪼갠다.
+# 글자 수로 재면 msg_too_long 이 난다.
 CHUNK_BYTES = 2800
 MAX_CHUNKS = 8
 
@@ -57,32 +62,15 @@ def _chunks(text: str, limit: int = CHUNK_BYTES) -> list[str]:
 
 def _sink(channel: str, client) -> brain.Sink:
     def say(text: str) -> str:
-        return client.chat_postMessage(channel=channel, text=_clip(text))["ts"]
+        parts = _chunks(text)[:MAX_CHUNKS]
+        ts = ""
+        for i, part in enumerate(parts):
+            head = f"_({i + 1}/{len(parts)})_\n" if len(parts) > 1 else ""
+            sent = client.chat_postMessage(channel=channel, text=head + part)
+            ts = ts or sent["ts"]
+        return ts
 
-    def reply(parent_ts: str, text: str) -> str:
-        return client.chat_postMessage(
-            channel=channel, thread_ts=parent_ts, text=_clip(text)
-        )["ts"]
-
-    def update(ts: str, text: str) -> None:
-        client.chat_update(channel=channel, ts=ts, text=_clip(text))
-
-    def result(parent_ts: str, running_ts: str, text: str, raw_path: str = "") -> None:
-        """긴 결과는 여러 덩어리로 쪼개 스레드에 이어 붙인다."""
-        parts = _chunks(text)
-        dropped = max(0, len(parts) - MAX_CHUNKS)
-        parts = parts[:MAX_CHUNKS]
-        if dropped:
-            tail = f"\n\n_…{dropped}덩어리 생략._"
-            if raw_path:
-                tail += f" 전체 원문: `{raw_path}`"
-            parts[-1] += tail
-
-        update(running_ts, parts[0])
-        for i, part in enumerate(parts[1:], start=2):
-            reply(parent_ts, f"_({i}/{len(parts)})_\n{part}")
-
-    return brain.Sink(say=say, reply=reply, update=update, result=result)
+    return brain.Sink(say=say)
 
 
 # ------------------------------------------------------------------ 명령어
@@ -91,7 +79,8 @@ ALIASES = {
     "clear": "clear", "초기화": "clear", "reset": "clear",
     "help": "help", "명령어": "help", "commands": "help", "?": "help",
     "projects": "projects", "sessions": "projects", "세션": "projects",
-    "mode": "mode", "권한": "mode",
+    "live": "live", "실행": "live", "running": "live",
+    "trust": "trust", "신뢰": "trust", "승인": "trust",
 }
 
 
@@ -99,24 +88,27 @@ def _command_of(text: str) -> str | None:
     """`/clear` `!clear` `.clear` 를 모두 같은 명령으로 본다."""
     if not text or text[0] not in "/!.":
         return None
-    return ALIASES.get(text[1:].split()[0].lower() if text[1:].split() else "")
+    word = text[1:].split()
+    return ALIASES.get(word[0].lower()) if word else None
 
 
 def _run_command(name: str, channel: str, say) -> None:
     if name == "clear":
         brain.clear(channel)
-        say("🧹 이 채널 대화 기억을 지웠어. 처음부터 다시 시작.")
+        say("🧹 이 채널 대화 기억을 지웠어. 처음부터 다시.")
     elif name == "help":
         lines = "\n".join(f"`{k}` — {v}" for k, v in brain.COMMANDS.items())
         say(
-            "*쓸 수 있는 명령어*\n" + lines +
-            "\n\n_슬래시(`/`) 대신 `!` 나 `.` 로 시작해도 되고, 한국어(`!초기화`, `!명령어`)도 먹혀._"
+            "*명령어*\n" + lines +
+            "\n\n_`!` `.` `/` 아무 걸로 시작해도 되고 한국어(`!초기화`, `!명령어`, `!실행`)도 먹혀._"
             "\n그 밖엔 그냥 말하거나 음성 보내면 내가 알아서 판단할게."
         )
     elif name == "projects":
         say("*Claude 프로젝트 / 최근 세션*\n```\n" + brain.catalog() + "\n```")
-    elif name == "mode":
-        say(f"현재 Claude 권한 모드: `{claude_runner.PERMISSION_MODE}`")
+    elif name == "live":
+        say("*지금 켜져 있는 Claude 세션*\n```\n" + brain.live_list() + "\n```")
+    elif name == "trust":
+        say(claude_runner.approve_trust())
 
 
 # ------------------------------------------------------------------ 음성 처리
@@ -166,14 +158,18 @@ def handle_message(event, client, logger):
         try:
             spoken = text
             if audio:
-                heard_ts = sink.say("🎧 듣는 중…")
+                heard = client.chat_postMessage(channel=channel, text="🎧 듣는 중…")
                 try:
-                    spoken = " ".join(x for x in (_transcribe(audio[0]), text) if x).strip()
+                    spoken = " ".join(
+                        x for x in (_transcribe(audio[0]), text) if x
+                    ).strip()
                 except Exception as exc:
                     logger.exception("STT 실패")
-                    sink.update(heard_ts, f"음성 인식에 실패했어: {exc}")
+                    client.chat_update(channel=channel, ts=heard["ts"],
+                                       text=f"음성 인식에 실패했어: {exc}")
                     return
-                sink.update(heard_ts, f"🎙️ “{spoken}”")
+                client.chat_update(channel=channel, ts=heard["ts"],
+                                   text=_clip(f"🎙️ “{spoken}”"))
 
             command = _command_of(spoken)
             if command:
@@ -198,8 +194,8 @@ def _slash(name: str):
     return handler
 
 
-for _cmd, _name in (("/clear", "clear"), ("/help", "help"),
-                    ("/projects", "projects"), ("/mode", "mode")):
+for _cmd, _name in (("/clear", "clear"), ("/help", "help"), ("/projects", "projects"),
+                    ("/live", "live"), ("/trust", "trust")):
     app.command(_cmd)(_slash(_name))
 
 
