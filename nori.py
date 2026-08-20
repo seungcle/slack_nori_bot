@@ -78,21 +78,25 @@ def _sink(channel: str, client) -> brain.Sink:
 ALIASES = {
     "clear": "clear", "초기화": "clear", "reset": "clear",
     "help": "help", "명령어": "help", "commands": "help", "?": "help",
-    "projects": "projects", "sessions": "projects", "세션": "projects",
+    "projects": "projects", "프로젝트": "projects", "목록": "projects",
+    "sessions": "sessions", "세션": "sessions",
+    "open": "open", "열기": "open", "열어": "open", "rc": "open",
     "live": "live", "실행": "live", "running": "live",
+    "stop": "stop", "종료": "stop", "닫기": "stop",
     "trust": "trust", "신뢰": "trust", "승인": "trust",
 }
 
 
-def _command_of(text: str) -> str | None:
-    """`/clear` `!clear` `.clear` 를 모두 같은 명령으로 본다."""
+def _command_of(text: str) -> tuple[str, str] | None:
+    """`/open nori` `!열기 nori` `.open nori` 를 모두 같은 명령으로 본다."""
     if not text or text[0] not in "/!.":
         return None
-    word = text[1:].split()
-    return ALIASES.get(word[0].lower()) if word else None
+    head, _, arg = text[1:].partition(" ")
+    name = ALIASES.get(head.lower())
+    return (name, arg.strip()) if name else None
 
 
-def _run_command(name: str, channel: str, say) -> None:
+def _run_command(name: str, arg: str, channel: str, say) -> None:
     if name == "clear":
         brain.clear(channel)
         say("🧹 이 채널 대화 기억을 지웠어. 처음부터 다시.")
@@ -100,11 +104,21 @@ def _run_command(name: str, channel: str, say) -> None:
         lines = "\n".join(f"`{k}` — {v}" for k, v in brain.COMMANDS.items())
         say(
             "*명령어*\n" + lines +
-            "\n\n_`!` `.` `/` 아무 걸로 시작해도 되고 한국어(`!초기화`, `!명령어`, `!실행`)도 먹혀._"
+            "\n\n예) `!open nori` · `!sessions e-project` · `!stop nori`"
+            "\n_`!` `.` `/` 아무 걸로 시작해도 되고 한국어(`!목록` `!세션` `!열기` `!실행` `!종료`)도 먹혀._"
             "\n그 밖엔 그냥 말하거나 음성 보내면 내가 알아서 판단할게."
         )
     elif name == "projects":
-        say("*Claude 프로젝트 / 최근 세션*\n```\n" + brain.catalog() + "\n```")
+        say("*열 수 있는 프로젝트*\n```\n" + brain.project_lines() + "\n```"
+            "\n_`!sessions <이름>` 으로 세션 보고, `!open <이름>` 으로 띄워._")
+    elif name == "sessions":
+        say(brain.session_lines(arg) if arg
+            else "어느 프로젝트? 예) `!sessions nori`\n```\n" + brain.project_lines() + "\n```")
+    elif name == "open":
+        say(brain.open_project(arg) if arg
+            else "어느 프로젝트? 예) `!open nori`\n```\n" + brain.project_lines() + "\n```")
+    elif name == "stop":
+        say(brain.stop_project(arg) if arg else "어느 프로젝트? 예) `!stop nori`")
     elif name == "live":
         say("*지금 켜져 있는 Claude 세션*\n```\n" + brain.live_list() + "\n```")
     elif name == "trust":
@@ -171,9 +185,8 @@ def handle_message(event, client, logger):
                 client.chat_update(channel=channel, ts=heard["ts"],
                                    text=_clip(f"🎙️ “{spoken}”"))
 
-            command = _command_of(spoken)
-            if command:
-                _run_command(command, channel, sink.say)
+            if (command := _command_of(spoken)):
+                _run_command(*command, channel, sink.say)
                 return
 
             brain.bind(channel, sink)
@@ -190,13 +203,13 @@ def _slash(name: str):
     def handler(ack, body, client):
         ack()
         channel = body["channel_id"]
-        _run_command(name, channel, _sink(channel, client).say)
+        _run_command(name, (body.get("text") or "").strip(),
+                     channel, _sink(channel, client).say)
     return handler
 
 
-for _cmd, _name in (("/clear", "clear"), ("/help", "help"), ("/projects", "projects"),
-                    ("/live", "live"), ("/trust", "trust")):
-    app.command(_cmd)(_slash(_name))
+for _name in ("clear", "help", "projects", "sessions", "open", "live", "stop", "trust"):
+    app.command(f"/{_name}")(_slash(_name))
 
 
 if __name__ == "__main__":

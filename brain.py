@@ -100,11 +100,14 @@ TOOLS = [
 ]
 
 COMMANDS = {
-    "/clear": "이 채널의 대화 기억을 지운다",
-    "/help": "쓸 수 있는 명령어 목록",
-    "/projects": "Claude 프로젝트와 최근 세션 목록",
+    "/projects": "열 수 있는 프로젝트 목록",
+    "/sessions <프로젝트>": "그 프로젝트의 Claude 세션 목록",
+    "/open <프로젝트>": "그 프로젝트 폴더에서 Remote Control 세션을 띄운다",
     "/live": "지금 켜져 있는 Claude 세션",
+    "/stop <프로젝트>": "노리가 띄운 세션을 닫는다",
     "/trust": "새 폴더 신뢰 확인이 걸려 있으면 승인",
+    "/clear": "이 채널의 대화 기억을 지운다",
+    "/help": "이 목록",
 }
 
 
@@ -117,6 +120,45 @@ def catalog(projects: int = 12, per_project: int = 5) -> str:
         for s in sessions.sessions_for(cwd, limit=per_project):
             lines.append(f"- {s.sid[:8]} · {s.label(60)}")
     return "\n".join(lines) or "(아직 세션 기록 없음)"
+
+
+def project_lines() -> str:
+    rows = sessions.projects(limit=30)
+    if not rows:
+        return "(프로젝트 없음)"
+    home = os.path.expanduser("~")
+    return "\n".join(
+        f"{i:2}. {cwd.replace(home, '~'):<50} 세션 {n}개"
+        for i, (cwd, n, _) in enumerate(rows, start=1)
+    )
+
+
+def session_lines(project: str) -> str:
+    cwd = resolve_project(project)
+    if cwd is None:
+        return f"`{project}` 라는 프로젝트를 못 찾았어.\n\n" + project_lines()
+    rows = sessions.sessions_for(cwd, limit=20)
+    if not rows:
+        return f"`{cwd}` 에 세션 기록이 없어."
+    body = "\n".join(f"- {s.sid[:8]} · {s.label(64)}" for s in rows)
+    return f"*{cwd}*\n{body}"
+
+
+def open_project(project: str) -> str:
+    cwd = resolve_project(project)
+    if cwd is None:
+        return f"`{project}` 라는 프로젝트를 못 찾았어.\n\n" + project_lines()
+    res = claude_runner.launch(cwd)
+    head = "✅" if res.ok else "⚠️"
+    tail = f"\n{res.url}" if res.url else ""
+    return f"{head} `{cwd}`\n{res.message}{tail}"
+
+
+def stop_project(project: str) -> str:
+    cwd = resolve_project(project)
+    if cwd is None:
+        return f"`{project}` 라는 프로젝트를 못 찾았어."
+    return claude_runner.stop(cwd)
 
 
 def live_list() -> str:
@@ -162,7 +204,7 @@ def system_prompt() -> str:
 
 # ---------------------------------------------------------------- 도구 실행
 
-def _resolve_project(name: str) -> str | None:
+def resolve_project(name: str) -> str | None:
     known = [cwd for cwd, _, _ in sessions.projects(limit=1000)]
     if name in known:
         return name
@@ -174,22 +216,22 @@ def _resolve_project(name: str) -> str | None:
 
 
 def _open_project(channel: str, project: str) -> str:
-    cwd = _resolve_project(project)
+    cwd = resolve_project(project)
     if cwd is None:
         return f"'{project}' 라는 프로젝트를 목록에서 못 찾았다. 사용자에게 다시 물어봐라."
 
     res = claude_runner.launch(cwd)
     if not res.ok:
-        return f"열기 실패. {res.message}"
-    return (f"열었다. 프로젝트 {cwd}, 세션 {res.session_id[:8] or '(확인중)'}, "
-            f"이름 {res.name}. {res.message} "
-            f"사용자에게 Claude 앱에서 이 세션을 잡으면 된다고 알려줘라.")
+        return (f"열기 실패했다. 이유를 사용자에게 그대로 전해라: {res.message}")
+    return (f"열었다. 프로젝트 {cwd}, 세션 주소 {res.url or '(확인중)'}, 이름 {res.name}. "
+            f"사용자에게 폰 Claude 앱의 Code 목록에서 '{res.name}' 을 잡거나 "
+            f"주소로 바로 들어가면 된다고 알려줘라.")
 
 
 def _read_work(channel: str, session: str = "", project: str = "", turns: int = 12) -> str:
     sid = (session or "").strip()
     if not sid:
-        cwd = _resolve_project(project) if project else None
+        cwd = resolve_project(project) if project else None
         if cwd is None:
             return "어느 프로젝트인지 몰라서 못 읽었다. 사용자에게 물어봐라."
         recent = sessions.sessions_for(cwd, limit=1)
