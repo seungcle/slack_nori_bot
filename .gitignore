@@ -1,0 +1,11 @@
+# 파이썬 / uv
+.venv/
+__pycache__/
+*.pyc
+
+# 비밀값
+.env
+
+# 런타임 상태 — 대화 기록과 작업 원문
+nori.db*
+runs/

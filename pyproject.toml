@@ -1,0 +1,13 @@
+[project]
+name = "nori"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "langchain-openai>=1.5.2",
+    "langgraph>=1.2.11",
+    "langgraph-checkpoint-sqlite>=3.1.1",
+    "openai>=3.3.0",
+    "python-dotenv>=1.2.3",
+    "requests>=2.34.2",
+    "slack-bolt>=1.30.0",
+]
